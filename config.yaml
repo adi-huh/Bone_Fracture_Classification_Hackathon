@@ -1,0 +1,59 @@
+# ============================================================
+# Bone Fracture Multi-Region X-ray Classification - Config
+# Hackathon Configuration File
+# ============================================================
+
+# Dataset
+# -------
+# Point this to the Kaggle "Bone Fracture Multi-Region X-ray Dataset" root.
+# The loader auto-discovers class names from sub-folder names.
+#
+# Current dataset on disk is binary (fractured / not fractured).
+# When you download the multi-class dataset, update dataset_path and
+# the fields below will be auto-detected from the folder structure.
+dataset_path: "dataset/Bone_Fracture_Binary_Classification/Bone_Fracture_Binary_Classification"
+num_classes: 7       # overridden at runtime by discovered classes
+class_names:         # overridden at runtime; listed here for reference
+  - "simple"
+  - "comminuted"
+  - "spiral"
+  - "stress"
+  - "greenstick"
+  - "compound"
+  - "pathological"
+image_size: 224
+batch_size: 16
+
+# Training
+epochs: 50
+learning_rate: 1.0e-4
+weight_decay: 1.0e-2
+early_stopping_patience: 10
+freeze_epochs: 10     # Phase 1: frozen backbones, train head only
+seed: 42
+num_workers: 2   # data loading workers
+
+# Model
+model_backbone: "efficientnet_b3"   # "efficientnet_b3" or "resnet50"
+vit_model: "vit_small_patch16_224"  # ViT head from timm
+fusion_method: "cross_attention"     # "cross_attention" or "concatenation"
+dropout: 0.3
+
+# Splits (only used when reorganising a flat dataset)
+train_ratio: 0.7
+val_ratio: 0.1
+test_ratio: 0.2
+
+# Scheduler
+scheduler: "cosine_annealing"
+T_max: 50
+
+# Cross-validation
+cv_folds: 5
+
+# Device (auto-detected at runtime)
+device: "auto"   # "auto", "cuda", "mps", "cpu"
+
+# Paths (auto-created)
+checkpoint_dir: "checkpoints"
+results_dir: "results"

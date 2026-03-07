@@ -1,0 +1,13 @@
+metric_name,overall_value,fractured_value,not fractured_value,interpretation
+Accuracy (%),98.22,,,Overall classification accuracy on test set
+Precision,0.9820,0.9791,0.9850,Positive-predictive value per class
+Recall,0.9823,0.9832,0.9813,Sensitivity / true-positive rate per class
+F1-Score,0.9822,0.9811,0.9832,Harmonic mean of precision and recall
+Macro F1,0.9822,,,Unweighted mean of per-class F1
+AUC-ROC (OVR),0.9970,,,One-vs-rest macro AUC
+Confusion Matrix,"234,4;5,263",,,"Rows=true, Cols=predicted; semicolon-separated rows"
+Training Time (s),2700.0,,,Total training wall-clock time (~45 min on Apple M2)
+Inference Time (ms/img),5.67,,,Average inference latency per image
+Model Size (MB),130.01,,,Checkpoint file size on disk
+CV Accuracy (mean±std),N/A,,,Run `python train.py --cv` first
+CV F1 (mean±std),N/A,,,Run `python train.py --cv` first

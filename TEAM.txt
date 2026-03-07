@@ -1,0 +1,9 @@
+Team Name: HybridMedicalVision
+Institution: [Your Institution]
+Members:
+  1. Aditya - [Role] - [Email]
+  2. [Member 2] - [Role] - [Email]
+  3. [Member 3] - [Role] - [Email]
+
+Contact: [Primary Contact Email]
+GitHub: https://github.com/adi-huh/HybridMedicalVision

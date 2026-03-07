@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Dataset (too large for git)
+dataset/
+
+# Model checkpoints (use Git LFS or download separately)
+checkpoints/
+medical-ct-xray-analyzer/
+Models/
+*.pth
+*.pt
+*.h5
+*.safetensors
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+server.log
+*.log
+
+# Old/unused files
+convert_model.py
+convert_safe_model.py
+image_classifier.py
+improved_visualization.py
+medical_app.py
+medical_dataset.py
+medical_pretrained_model.py
+safe_model_utils.py
+requirements_medicaltxt
+yolov8x.pt
