@@ -26,6 +26,10 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Presentation
+presentation.pdf
+create_presentation.py
+
 # Logs
 server.log
 *.log
