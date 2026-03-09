@@ -45,3 +45,6 @@ medical_pretrained_model.py
 safe_model_utils.py
 requirements_medicaltxt
 yolov8x.pt
+
+# Gradio cache
+.gradio/
