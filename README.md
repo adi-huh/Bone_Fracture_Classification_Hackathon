@@ -10,6 +10,7 @@ license: MIT license
 
 A **Hybrid CNN + Vision Transformer** system for bone fracture classification from X-ray radiographs, built for the **KBG Hackathon 2025** (Kamand Bioengineering Group, IIT Mandi).
 
+Live Link :- https://huggingface.co/spaces/Adi-huh/Bone-Fracture-Classifier
 ## Classification Task
 
 | # | Class | Description |
