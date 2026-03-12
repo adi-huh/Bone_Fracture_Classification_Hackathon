@@ -48,3 +48,21 @@ yolov8x.pt
 
 # Gradio cache
 .gradio/
+
+# Backup/temp files
+app_old_backup.py
+app_old_v2.py
+app_clean.py
+resume_fast.py
+test_eval.py
+training_log.txt
+archive.zip
+
+# Chest X-ray dataset (too large)
+chest_xray/
+
+# Old medical models
+medical_models/
+
+# PDFs
+*.pdf

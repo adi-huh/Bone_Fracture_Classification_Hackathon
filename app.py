@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
-app.py — Gradio Web App for Bone Fracture Classification
-=========================================================
+Unified Medical X-ray Classifier
 KBG Hackathon 2025 — IIT Mandi
-Hybrid CNN + Vision Transformer with Grad-CAM Explainability
-
-Deploy to Hugging Face Spaces:
-    gradio deploy
 """
 
 import os
@@ -24,15 +19,21 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from model import build_model
-from data_loader import load_config
 
 # ── Paths ──────────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(ROOT, "config.yaml")
-CHECKPOINT = os.path.join(ROOT, "checkpoints", "model.pth")
-CM_IMG = os.path.join(ROOT, "results", "confusion_matrix.png")
-EXPLAIN_FRAC = os.path.join(ROOT, "results", "explainability", "fractured_explainability.png")
-EXPLAIN_NOFRAC = os.path.join(ROOT, "results", "explainability", "not fractured_explainability.png")
+UNIFIED_CHECKPOINT = os.path.join(ROOT, "checkpoints", "unified_model.pth")
+
+# Class names
+CLASS_NAMES = ["fractured", "not fractured", "NORMAL", "PNEUMONIA"]
+DISPLAY_NAMES = {
+    "fractured": "Fractured",
+    "not fractured": "Not Fractured",
+    "NORMAL": "Normal Lungs",
+    "PNEUMONIA": "Pneumonia",
+}
+BONE_CLASSES = {0, 1}
+CHEST_CLASSES = {2, 3}
 
 
 # ── Device ─────────────────────────────────────────────────────────
@@ -44,30 +45,33 @@ def get_device():
     return torch.device("cpu")
 
 
-# ── Model loader (cached) ─────────────────────────────────────────
+# ── Model loader ───────────────────────────────────────────────────
 @functools.lru_cache(maxsize=1)
 def load_model():
     device = get_device()
-    config = load_config(CONFIG_PATH)
+    if not os.path.exists(UNIFIED_CHECKPOINT):
+        raise FileNotFoundError(
+            f"Checkpoint not found at {UNIFIED_CHECKPOINT}. "
+            "Run train_unified.py first."
+        )
 
-    ckpt = torch.load(CHECKPOINT, map_location=device, weights_only=False)
-
-    # Infer classes from checkpoint
-    if "class_names" in ckpt:
-        class_names = ckpt["class_names"]
-    else:
-        last_w = ckpt["model_state_dict"]["classifier.3.weight"]
-        n = last_w.shape[0]
-        class_names = ["fractured", "not fractured"] if n == 2 else [f"class_{i}" for i in range(n)]
-
+    ckpt = torch.load(UNIFIED_CHECKPOINT, map_location=device, weights_only=False)
+    class_names = ckpt.get("class_names", CLASS_NAMES)
+    config = ckpt.get("config", {})
     config["num_classes"] = len(class_names)
+    config.setdefault("model_backbone", "efficientnet_b3")
+    config.setdefault("vit_model", "vit_small_patch16_224")
+    config.setdefault("fusion_method", "cross_attention")
+    config.setdefault("dropout", 0.3)
+    config.setdefault("image_size", 224)
 
     mdl = build_model(config)
     mdl.load_state_dict(ckpt["model_state_dict"])
-    mdl.to(device)
-    mdl.eval()
+    mdl.to(device).eval()
 
-    print(f"[app] Model loaded | Device: {device} | Classes: {class_names}")
+    val_acc = ckpt.get("val_accuracy", "N/A")
+    epoch = ckpt.get("epoch", "N/A")
+    print(f"[app] Model loaded | {device} | Val Acc: {val_acc}% | Epoch: {epoch}")
     return mdl, device, class_names, config
 
 
@@ -87,7 +91,6 @@ class GradCAM:
         self.device = device
         self.gradients = None
         self.activations = None
-
         target = self._find_target_layer()
         target.register_forward_hook(self._fwd_hook)
         target.register_full_backward_hook(self._bwd_hook)
@@ -117,10 +120,8 @@ class GradCAM:
         if cls_idx is None:
             cls_idx = out.argmax(dim=1).item()
         out[0, cls_idx].backward(retain_graph=True)
-
         if self.gradients is None or self.activations is None:
             return None
-
         w = self.gradients.mean(dim=[2, 3], keepdim=True)
         cam = F.relu((w * self.activations).sum(dim=1, keepdim=True))
         cam = cam.squeeze().cpu().detach().numpy()
@@ -156,626 +157,265 @@ def predict(image):
         pred_idx = probs.argmax(dim=1).item()
         cam = grad_cam.generate(tensor, cls_idx=pred_idx)
 
-    # Confidences
-    confidences = {class_names[i]: float(probs[0, i].item()) for i in range(len(class_names))}
+    confidences = {}
+    for i, cn in enumerate(class_names):
+        confidences[DISPLAY_NAMES.get(cn, cn)] = float(probs[0, i].item())
 
-    # Grad-CAM overlay
+    colormap = cv2.COLORMAP_MAGMA if pred_idx in CHEST_CLASSES else cv2.COLORMAP_JET
     if cam is not None:
         cam_r = cv2.resize(cam, (orig_w, orig_h))
-        heatmap = cv2.applyColorMap(np.uint8(255 * cam_r), cv2.COLORMAP_JET)
+        heatmap = cv2.applyColorMap(np.uint8(255 * cam_r), colormap)
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-        overlay = np.clip(np.float32(heatmap) * 0.4 + np.float32(img_np) * 0.6, 0, 255).astype(np.uint8)
+        overlay = np.clip(
+            np.float32(heatmap) * 0.4 + np.float32(img_np) * 0.6, 0, 255
+        ).astype(np.uint8)
         overlay_img = Image.fromarray(overlay)
     else:
         overlay_img = image
 
-    # Report
-    pred_class = class_names[pred_idx].upper()
+    pred_class = class_names[pred_idx]
+    pred_display = DISPLAY_NAMES.get(pred_class, pred_class)
     conf_pct = probs[0, pred_idx].item() * 100
-    report = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  BONE FRACTURE ANALYSIS REPORT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    xray_type = "Bone X-ray" if pred_idx in BONE_CLASSES else "Chest X-ray"
 
-  Classification:  {pred_class}
-  Confidence:      {conf_pct:.1f}%
+    bone_frac = probs[0, 0].item() * 100
+    bone_nofrac = probs[0, 1].item() * 100
+    chest_normal = probs[0, 2].item() * 100
+    chest_pneum = probs[0, 3].item() * 100
 
-  Per-Class Probabilities:
+    def bar(val):
+        filled = int(val / 5)
+        return "=" * filled + "-" * (20 - filled)
+
+    report = f"""
+  MEDICAL X-RAY ANALYSIS REPORT
+  -----------------------------------------------
+
+  Detected Type  :  {xray_type}
+  Classification :  {pred_display}
+  Confidence     :  {conf_pct:.1f}%
+
+  -----------------------------------------------
+  Bone Analysis
+  -----------------------------------------------
+      Fractured     :  [{bar(bone_frac)}] {bone_frac:.1f}%
+      Not Fractured :  [{bar(bone_nofrac)}] {bone_nofrac:.1f}%
+
+  -----------------------------------------------
+  Chest Analysis
+  -----------------------------------------------
+      Normal        :  [{bar(chest_normal)}] {chest_normal:.1f}%
+      Pneumonia     :  [{bar(chest_pneum)}] {chest_pneum:.1f}%
+
+  -----------------------------------------------
+  Interpretation
+  -----------------------------------------------
 """
-    for i, cn in enumerate(class_names):
-        p = probs[0, i].item() * 100
-        bar = "█" * int(p / 5) + "░" * (20 - int(p / 5))
-        report += f"    {cn:>15s}:  {bar} {p:.1f}%\n"
+    if pred_idx == 0:
+        report += "  Fracture indicators detected.\n"
+        report += "  The heatmap highlights the suspected fracture region.\n"
+    elif pred_idx == 1:
+        report += "  No fracture indicators detected.\n"
+        report += "  The bone structure appears intact.\n"
+    elif pred_idx == 2:
+        report += "  No pneumonia indicators detected.\n"
+        report += "  The lung fields appear clear.\n"
+    elif pred_idx == 3:
+        report += "  Pneumonia indicators detected.\n"
+        report += "  The heatmap highlights the affected lung regions.\n"
 
-    report += f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  INTERPRETATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-    if pred_idx == 0:  # fractured
-        if conf_pct > 90:
-            report += "  ⚠️  HIGH CONFIDENCE: Fracture indicators detected.\n  The Grad-CAM heatmap highlights the suspected fracture region."
-        else:
-            report += "  ⚠️  MODERATE CONFIDENCE: Possible fracture indicators.\n  Review the Grad-CAM heatmap for highlighted regions."
-    else:
-        if conf_pct > 90:
-            report += "  ✅  HIGH CONFIDENCE: No fracture indicators detected.\n  The bone structure appears intact."
-        else:
-            report += "  ✅  MODERATE CONFIDENCE: Likely no fracture.\n  Consider clinical correlation if symptoms persist."
+    if conf_pct < 80:
+        report += "\n  Note: Moderate confidence — consider clinical correlation.\n"
 
-    report += "\n\n  ⚕️  This is a research tool. Always consult a qualified\n     radiologist for clinical decisions."
+    report += "\n  This is a research tool. Always consult a qualified\n  radiologist for clinical decisions."
 
     return confidences, overlay_img, report
 
 
 # ══════════════════════════════════════════════════════════════════
-#  GRADIO UI
+#  UI
 # ══════════════════════════════════════════════════════════════════
 
 custom_css = """
-/* ── FORCE DARK THEME ─────────────────────────────────────────── */
 body, .gradio-container, .main, .app, .contain,
 .gradio-container > div, .gradio-container > div > div {
     background: #0d1117 !important;
-    color: #e6edf3 !important;
+    color: #c9d1d9 !important;
 }
 .gradio-container *, .gradio-container p, .gradio-container span,
 .gradio-container li, .gradio-container td, .gradio-container th,
 .gradio-container h1, .gradio-container h2, .gradio-container h3,
 .gradio-container h4, .gradio-container b, .gradio-container strong,
 .gradio-container label, .gradio-container div, .gradio-container a,
-.gradio-container ul, .gradio-container ol, .gradio-container pre,
-.gradio-container input, .gradio-container textarea {
-    color: #e6edf3 !important;
+.gradio-container pre, .gradio-container input, .gradio-container textarea {
+    color: #c9d1d9 !important;
 }
-/* Blocks and panels */
-.gradio-container .block,
-.gradio-container .tabitem,
-.gradio-container .panel,
-.gradio-container .form,
+.gradio-container .block, .gradio-container .tabitem,
+.gradio-container .panel, .gradio-container .form,
 .gradio-container .wrap {
     background: #161b22 !important;
-    border-color: #30363d !important;
+    border-color: #21262d !important;
 }
-/* ── Header banner ──────────────────────────────────────────────── */
-.main-header {
-    background: linear-gradient(135deg, #1a3a5c 0%, #0f3460 50%, #16213e 100%) !important;
-    padding: 30px 20px;
-    border-radius: 12px;
-    text-align: center;
-    margin-bottom: 15px;
+.header-bar {
+    background: linear-gradient(135deg, #161b22 0%, #0d1117 100%) !important;
+    padding: 32px 24px; border-radius: 8px; text-align: center;
+    margin-bottom: 16px; border: 1px solid #21262d;
 }
-.main-header * { color: #ffffff !important; }
-/* ── Section card ──────────────────────────────────────────────── */
-.section-card {
-    background: #161b22 !important;
-    padding: 18px 20px;
-    border-radius: 10px;
-    border-left: 5px solid #58a6ff;
-    margin: 12px 0;
+.header-bar h1 { color: #f0f6fc !important; font-size: 1.8em; margin: 0; font-weight: 600; letter-spacing: -0.02em; }
+.header-bar p { color: #8b949e !important; margin: 6px 0 0; font-size: 0.95em; }
+.stat-row {
+    display: flex; gap: 12px; margin: 16px 0; flex-wrap: wrap; justify-content: center;
 }
-.section-card * { color: #e6edf3 !important; }
-/* ── Metric grid ───────────────────────────────────────────────── */
-.metric-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 15px;
-    margin: 15px 0;
+.stat-pill {
+    background: #161b22 !important; border: 1px solid #21262d;
+    padding: 10px 20px; border-radius: 6px; text-align: center; flex: 1; min-width: 140px;
 }
-.metric-card {
-    background: linear-gradient(135deg, #161b22, #1c2333) !important;
-    padding: 20px;
-    border-radius: 10px;
-    text-align: center;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-    border: 1px solid #30363d;
+.stat-pill .num { font-size: 1.4em; font-weight: 700; color: #58a6ff !important; display: block; }
+.stat-pill .lbl { font-size: 0.78em; color: #8b949e !important; text-transform: uppercase; letter-spacing: 0.05em; }
+.subtle-card {
+    background: #161b22 !important; padding: 16px 20px; border-radius: 8px;
+    border: 1px solid #21262d; margin: 8px 0;
 }
-.metric-card .value {
-    font-size: 2em;
-    font-weight: 800;
-    color: #58a6ff !important;
-    display: block;
-    margin: 8px 0;
+.subtle-card h3 { margin: 0 0 8px; font-size: 0.95em; color: #c9d1d9 !important; font-weight: 600; }
+.subtle-card p, .subtle-card li { color: #8b949e !important; font-size: 0.88em; line-height: 1.7; }
+.disclaimer {
+    background: #161b22 !important; border: 1px solid #30363d;
+    padding: 14px 20px; border-radius: 6px; margin: 20px 0 8px;
 }
-.metric-card .label {
-    font-size: 0.9em;
-    color: #8b949e !important;
-    font-weight: 600;
+.disclaimer p { color: #8b949e !important; font-size: 0.82em; margin: 0; line-height: 1.5; }
+.disclaimer b { color: #c9d1d9 !important; }
+.footer-line {
+    text-align: center; padding: 16px; margin-top: 8px;
 }
-/* ── Arch box (dark code block) ────────────────────────────────── */
-.arch-box {
-    background: #0d1117 !important;
-    padding: 20px;
-    border-radius: 10px;
-    border: 1px solid #30363d;
-    font-family: 'Cascadia Code', 'Fira Code', monospace;
-    font-size: 13px;
-    line-height: 1.5;
-    overflow-x: auto;
-}
-.arch-box, .arch-box *, .arch-box pre { color: #7ee787 !important; }
-/* ── Info card ─────────────────────────────────────────────────── */
-.info-card {
-    background: #161b22 !important;
-    padding: 20px;
-    border-radius: 10px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-    border: 1px solid #30363d;
-}
-.info-card * { color: #e6edf3 !important; }
-.info-card table { background: #161b22 !important; }
-.info-card td, .info-card th { color: #e6edf3 !important; }
-/* Dark-header rows in tables */
-.dark-header th { color: #ffffff !important; background: #0f3460 !important; }
-/* Light-row on dark theme = slightly lighter dark bg */
-.light-row { background: #1c2333 !important; }
-.light-row td, .light-row th { color: #e6edf3 !important; }
-/* ── Warning box ───────────────────────────────────────────────── */
-.warning-box {
-    background: #2d1f00 !important;
-    border-left: 5px solid #ff9800;
-    padding: 18px 20px;
-    border-radius: 8px;
-    margin: 15px 0;
-}
-.warning-box * { color: #ffd580 !important; }
-/* ── Footer ────────────────────────────────────────────────────── */
-.footer-box {
-    text-align: center;
-    padding: 25px;
-    background: #161b22 !important;
-    border-radius: 10px;
-    margin-top: 20px;
-    border: 1px solid #30363d;
-}
-.footer-box * { color: #e6edf3 !important; }
-/* ── Gradio component overrides ────────────────────────────────── */
-.gradio-container .label-wrap { color: #e6edf3 !important; }
-.gradio-container .output-class { color: #e6edf3 !important; }
-.gradio-container input, .gradio-container textarea,
-.gradio-container select {
-    background: #0d1117 !important;
-    color: #e6edf3 !important;
-    border-color: #30363d !important;
+.footer-line p { color: #484f58 !important; font-size: 0.8em; margin: 2px 0; }
+.footer-line span { color: #58a6ff !important; }
+.gradio-container input, .gradio-container textarea, .gradio-container select {
+    background: #0d1117 !important; color: #c9d1d9 !important; border-color: #21262d !important;
 }
 .gradio-container button.primary {
-    background: #238636 !important;
-    color: #ffffff !important;
-    border: 1px solid #2ea043 !important;
+    background: #238636 !important; color: #fff !important; border: 1px solid #2ea043 !important;
+    font-weight: 600;
 }
-.gradio-container button.primary:hover {
-    background: #2ea043 !important;
-}
-hr { border-color: #30363d !important; }
+.gradio-container button.primary:hover { background: #2ea043 !important; }
+hr { border-color: #21262d !important; }
 """
 
 
 def create_interface():
-    with gr.Blocks(title="Bone Fracture Classifier | KBG Hackathon 2025", css=custom_css) as demo:
+    with gr.Blocks(title="Medical X-ray Analyzer") as demo:
 
-        # Inject CSS as <style> tag for bulletproof application
         gr.HTML(f"<style>{custom_css}</style>")
 
-        # ── HEADER ─────────────────────────────────────────────
+        # Header
         gr.HTML("""
-        <div class="main-header">
-            <h1 style="margin:0; font-size:2.5em;">🦴 Bone Fracture Classification System</h1>
-            <p style="margin:8px 0 0; font-size:1.15em; opacity:0.9;">
-                Hybrid CNN + Vision Transformer with Cross-Attention Fusion
-            </p>
-            <p style="margin:5px 0 0; font-size:0.95em; opacity:0.75;">
-                KBG Hackathon 2025 &nbsp;•&nbsp; Kamand Bioengineering Group &nbsp;•&nbsp; IIT Mandi
-            </p>
+        <div class="header-bar">
+            <h1>Medical X-ray Analysis System</h1>
+            <p>Bone Fracture Detection &middot; Lung Pneumonia Detection &middot; Unified Model</p>
         </div>
         """)
 
-        # ── KEY METRICS BAR ────────────────────────────────────
+        # Stats
         gr.HTML("""
-        <div class="metric-grid">
-            <div class="metric-card">
-                <span class="label">Test Accuracy</span>
-                <span class="value">98.22%</span>
+        <div class="stat-row">
+            <div class="stat-pill">
+                <span class="num">HybridCNNViT</span>
+                <span class="lbl">Model</span>
             </div>
-            <div class="metric-card">
-                <span class="label">Macro F1-Score</span>
-                <span class="value">0.9822</span>
+            <div class="stat-pill">
+                <span class="num">95.86%</span>
+                <span class="lbl">Val Accuracy</span>
             </div>
-            <div class="metric-card">
-                <span class="label">AUC-ROC</span>
-                <span class="value">0.9970</span>
+            <div class="stat-pill">
+                <span class="num">87.5%</span>
+                <span class="lbl">Test Accuracy</span>
             </div>
-            <div class="metric-card">
-                <span class="label">Inference Speed</span>
-                <span class="value">5.67ms</span>
+            <div class="stat-pill">
+                <span class="num">4</span>
+                <span class="lbl">Classes</span>
             </div>
-            <div class="metric-card">
-                <span class="label">Model Size</span>
-                <span class="value">130 MB</span>
-            </div>
-            <div class="metric-card">
-                <span class="label">Training Time</span>
-                <span class="value">~45 min</span>
+            <div class="stat-pill">
+                <span class="num">14,462</span>
+                <span class="lbl">Training Images</span>
             </div>
         </div>
         """)
 
-        # ── CLASSIFIER SECTION ─────────────────────────────────
-        gr.HTML("""
-        <div class="section-card">
-            <h2 style="margin:0;">🔬 Live Classification with Grad-CAM Explainability</h2>
-            <p style="margin:5px 0 0; color:#e6edf3;">Upload a bone X-ray image to classify it as <b>Fractured</b> or <b>Not Fractured</b>.
-            The Grad-CAM heatmap highlights regions the model focuses on for its decision.</p>
-        </div>
-        """)
-
+        # Classifier
         with gr.Row(equal_height=True):
             with gr.Column(scale=1):
-                input_image = gr.Image(type="pil", label="📤 Upload Bone X-ray", height=380)
-                predict_btn = gr.Button("🔍 Classify Fracture", variant="primary", size="lg")
+                input_image = gr.Image(type="pil", label="Upload X-ray", height=400)
+                predict_btn = gr.Button("Analyze", variant="primary", size="lg")
 
             with gr.Column(scale=1):
-                output_label = gr.Label(label="📊 Prediction", num_top_classes=2)
-                output_cam = gr.Image(label="🔥 Grad-CAM Heatmap Overlay", height=380)
+                output_label = gr.Label(label="Classification", num_top_classes=4)
+                output_cam = gr.Image(label="Grad-CAM Heatmap", height=400)
 
         with gr.Row():
             with gr.Column():
-                output_report = gr.Textbox(label="📋 Detailed Analysis Report", lines=18, max_lines=25)
+                output_report = gr.Textbox(label="Report", lines=22, max_lines=30)
 
-        predict_btn.click(fn=predict, inputs=input_image, outputs=[output_label, output_cam, output_report])
-        input_image.change(fn=predict, inputs=input_image, outputs=[output_label, output_cam, output_report])
+        predict_btn.click(
+            fn=predict,
+            inputs=input_image,
+            outputs=[output_label, output_cam, output_report],
+        )
+        input_image.change(
+            fn=predict,
+            inputs=input_image,
+            outputs=[output_label, output_cam, output_report],
+        )
 
-        gr.HTML("<hr style='margin:30px 0; border:none; border-top:1px solid #30363d;'>")
+        gr.HTML("<hr style='margin:24px 0; border:none; border-top:1px solid #21262d;'>")
 
-        # ── MODEL ARCHITECTURE ─────────────────────────────────
-        gr.HTML("""
-        <div class="section-card">
-            <h2 style="margin:0;">🧠 Model Architecture — HybridCNNViT</h2>
-            <p style="margin:5px 0 0; color:#e6edf3;">Dual-backbone architecture combining local CNN features with global ViT attention</p>
-        </div>
-        """)
-
-        gr.HTML("""
-        <div class="arch-box">
-<pre style="color:#e0e0e0 !important; margin:0;">
-              ┌─────────────────────────────────────────────────────────┐
-              │              Input Image (B, 3, 224, 224)               │
-              └─────────────┬───────────────────────┬───────────────────┘
-                            │                       │
-              ┌─────────────▼──────────┐ ┌──────────▼───────────────┐
-              │   EfficientNet-B3      │ │   ViT-Small-Patch16-224  │
-              │   CNN Backbone         │ │   Vision Transformer     │
-              │   (d=1536, ImageNet)   │ │   (d=384, ImageNet)      │
-              │   Local Features:      │ │   Global Features:       │
-              │   texture, edges,      │ │   spatial relationships, │
-              │   bone cortex patterns │ │   fracture line context  │
-              └─────────────┬──────────┘ └──────────┬───────────────┘
-                            │                       │
-              ┌─────────────▼───────────────────────▼───────────────┐
-              │           Cross-Attention Fusion (d=512)            │
-              │   Q = CNN features | K,V = ViT features            │
-              │   Bidirectional feature interaction                 │
-              └─────────────────────────┬───────────────────────────┘
-                                        │
-              ┌─────────────────────────▼───────────────────────────┐
-              │   Classification Head                               │
-              │   Linear(512→256) → ReLU → Dropout(0.3) → Linear(2)│
-              └─────────────────────────┬───────────────────────────┘
-                                        │
-              ┌─────────────────────────▼───────────────────────────┐
-              │          Output: Fractured / Not Fractured          │
-              └─────────────────────────────────────────────────────┘
-</pre>
-        </div>
-        """)
-
+        # Features
         with gr.Row():
             with gr.Column():
                 gr.HTML("""
-                <div class="info-card">
-                    <h3 style="margin-top:0; color:#e6edf3;">⚙️ Training Strategy — 2-Phase Transfer Learning</h3>
-                    <table style="width:100%; border-collapse:collapse; margin-top:10px; background:#161b22;">
-                        <tr style="background:#1c2333;" class="light-row">
-                            <th style="padding:10px; text-align:left; border-bottom:2px solid #30363d; color:#e6edf3;">Setting</th>
-                            <th style="padding:10px; text-align:left; border-bottom:2px solid #30363d; color:#e6edf3;">Phase 1 (Frozen)</th>
-                            <th style="padding:10px; text-align:left; border-bottom:2px solid #30363d; color:#e6edf3;">Phase 2 (Fine-tune)</th>
-                        </tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Epochs</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">1–10</td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">11–15 (early stopped)</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Trainable Params</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">1.58M (fusion + head)</td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">33.9M (all layers)</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Learning Rate</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">1e-4</td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">1e-5</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Optimizer</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;" colspan="2">AdamW (weight_decay=1e-2)</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Scheduler</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;" colspan="2">CosineAnnealingLR</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Loss Function</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;" colspan="2">CrossEntropyLoss</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Batch Size</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;" colspan="2">16</td></tr>
-                        <tr class="light-row"><td style="padding:8px; color:#e6edf3;"><b>Early Stopping</b></td>
-                            <td style="padding:8px; color:#e6edf3;" colspan="2">Patience=10 on Val F1 (best: epoch 13)</td></tr>
-                    </table>
+                <div class="subtle-card">
+                    <h3>How it works</h3>
+                    <p>Upload any bone or chest X-ray. The model automatically
+                    determines the type and classifies it into one of four
+                    categories: Fractured, Not Fractured, Normal Lungs,
+                    or Pneumonia.</p>
                 </div>
                 """)
             with gr.Column():
                 gr.HTML("""
-                <div class="info-card">
-                    <h3 style="margin-top:0; color:#e6edf3;">📊 Dataset & Preprocessing</h3>
-                    <table style="width:100%; border-collapse:collapse; margin-top:10px; background:#161b22;">
-                        <tr style="background:#1c2333;" class="light-row">
-                            <th style="padding:10px; text-align:left; border-bottom:2px solid #30363d; color:#e6edf3;">Property</th>
-                            <th style="padding:10px; text-align:left; border-bottom:2px solid #30363d; color:#e6edf3;">Value</th>
-                        </tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Source</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">Kaggle Bone Fracture Binary Classification</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Total Images</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">10,581</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Train / Val / Test</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">9,246 / 829 / 506</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Classes</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">Fractured, Not Fractured</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Image Size</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">224 × 224 (resized)</td></tr>
-                        <tr class="light-row"><td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Normalization</b></td>
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;">ImageNet μ, σ</td></tr>
-                    </table>
-                    <h4 style="margin-top:15px;">🔄 Augmentation (Training Only)</h4>
-                    <ul style="line-height:2; margin:5px 0;">
-                        <li><b>Horizontal Flip</b> (p=0.5)</li>
-                        <li><b>Affine Rotation</b> ±15°</li>
-                        <li><b>Brightness/Contrast</b> ±20%</li>
-                        <li><b>CLAHE</b> (clip_limit=2.0)</li>
+                <div class="subtle-card">
+                    <h3>Grad-CAM Explainability</h3>
+                    <p>Each prediction includes a heatmap overlay showing which
+                    regions of the image the model focused on. Bone X-rays use
+                    a warm colormap, chest X-rays use a purple-bright scale.</p>
+                </div>
+                """)
+            with gr.Column():
+                gr.HTML("""
+                <div class="subtle-card">
+                    <h3>Model Details</h3>
+                    <ul style="margin:0; padding-left:18px;">
+                        <li>EfficientNet-B3 + ViT-Small backbone</li>
+                        <li>Cross-attention fusion</li>
+                        <li>Trained on 14,462 images (8 epochs)</li>
+                        <li>Weighted loss for class imbalance</li>
                     </ul>
                 </div>
                 """)
 
-        gr.HTML("<hr style='margin:30px 0; border:none; border-top:1px solid #30363d;'>")
-
-        # ── RESULTS ────────────────────────────────────────────
+        # Disclaimer
         gr.HTML("""
-        <div class="section-card">
-            <h2 style="margin:0;">📈 Performance Results</h2>
-            <p style="margin:5px 0 0; color:#e6edf3;">Comprehensive evaluation on held-out test set (506 images)</p>
+        <div class="disclaimer">
+            <p><b>Disclaimer</b> — This system is for educational and research
+            purposes only (KBG Hackathon 2025, IIT Mandi). It is not a certified
+            medical device. All results must be verified by qualified healthcare
+            professionals before any clinical decision is made.</p>
         </div>
         """)
 
-        with gr.Row():
-            with gr.Column():
-                gr.HTML("""
-                <div class="info-card">
-                    <h3 style="margin-top:0; color:#e6edf3;">Per-Class Metrics</h3>
-                    <table style="width:100%; border-collapse:collapse; margin-top:10px; background:#161b22;">
-                        <tr style="background:#1c2333;" class="light-row">
-                            <th style="padding:10px; text-align:left; border-bottom:2px solid #30363d; color:#e6edf3;">Class</th>
-                            <th style="padding:10px; text-align:center; border-bottom:2px solid #30363d; color:#e6edf3;">Precision</th>
-                            <th style="padding:10px; text-align:center; border-bottom:2px solid #30363d; color:#e6edf3;">Recall</th>
-                            <th style="padding:10px; text-align:center; border-bottom:2px solid #30363d; color:#e6edf3;">F1-Score</th>
-                            <th style="padding:10px; text-align:center; border-bottom:2px solid #30363d; color:#e6edf3;">Support</th>
-                        </tr>
-                        <tr class="light-row">
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Fractured</b></td>
-                            <td style="padding:8px; text-align:center; border-bottom:1px solid #30363d; color:#e6edf3;">0.9791</td>
-                            <td style="padding:8px; text-align:center; border-bottom:1px solid #30363d; color:#e6edf3;">0.9832</td>
-                            <td style="padding:8px; text-align:center; border-bottom:1px solid #30363d; color:#e6edf3;">0.9811</td>
-                            <td style="padding:8px; text-align:center; border-bottom:1px solid #30363d; color:#e6edf3;">238</td>
-                        </tr>
-                        <tr class="light-row">
-                            <td style="padding:8px; border-bottom:1px solid #30363d; color:#e6edf3;"><b>Not Fractured</b></td>
-                            <td style="padding:8px; text-align:center; border-bottom:1px solid #30363d; color:#e6edf3;">0.9850</td>
-                            <td style="padding:8px; text-align:center; border-bottom:1px solid #30363d; color:#e6edf3;">0.9813</td>
-                            <td style="padding:8px; text-align:center; border-bottom:1px solid #30363d; color:#e6edf3;">0.9832</td>
-                            <td style="padding:8px; text-align:center; border-bottom:1px solid #30363d; color:#e6edf3;">268</td>
-                        </tr>
-                        <tr style="background:#0d2818;" class="light-row">
-                            <td style="padding:8px; color:#e6edf3;"><b>Macro Average</b></td>
-                            <td style="padding:8px; text-align:center; color:#e6edf3;"><b>0.9820</b></td>
-                            <td style="padding:8px; text-align:center; color:#e6edf3;"><b>0.9823</b></td>
-                            <td style="padding:8px; text-align:center; color:#e6edf3;"><b>0.9822</b></td>
-                            <td style="padding:8px; text-align:center; color:#e6edf3;"><b>506</b></td>
-                        </tr>
-                    </table>
-                    <p style="margin-top:15px; color:#e6edf3;">
-                        <b>Confusion Matrix:</b> 234 TP, 263 TN, 4 FP, 5 FN — only <b>9 errors</b> out of 506 images.
-                    </p>
-                </div>
-                """)
-
-            with gr.Column():
-                if os.path.exists(CM_IMG):
-                    gr.Image(value=CM_IMG, label="Confusion Matrix", height=350)
-                else:
-                    gr.HTML("""
-                    <div class="info-card" style="text-align:center; padding:40px;">
-                        <h3 style="color:#e6edf3;">Confusion Matrix</h3>
-                        <pre style="font-size:16px; color:#e6edf3;">
-              Predicted
-            Frac   Not-Frac
-Frac  [ 234      4   ]
-Not   [   5    263   ]
-                        </pre>
-                    </div>
-                    """)
-
-        gr.HTML("<hr style='margin:30px 0; border:none; border-top:1px solid #30363d;'>")
-
-        # ── EXPLAINABILITY ─────────────────────────────────────
+        # Footer
         gr.HTML("""
-        <div class="section-card">
-            <h2 style="margin:0;">🔍 Explainability — Grad-CAM & Attention Maps</h2>
-            <p style="margin:5px 0 0; color:#e6edf3;">
-                <b>Grad-CAM</b> highlights CNN regions relevant to classification.
-                <b>Attention Rollout</b> shows ViT global focus patterns.
-                Both confirm the model focuses on clinically relevant bone structures.
-            </p>
-        </div>
-        """)
-
-        with gr.Row():
-            if os.path.exists(EXPLAIN_FRAC):
-                with gr.Column():
-                    gr.Image(value=EXPLAIN_FRAC, label="Fractured — Grad-CAM + Attention Analysis", height=350)
-            if os.path.exists(EXPLAIN_NOFRAC):
-                with gr.Column():
-                    gr.Image(value=EXPLAIN_NOFRAC, label="Not Fractured — Grad-CAM + Attention Analysis", height=350)
-
-        gr.HTML("<hr style='margin:30px 0; border:none; border-top:1px solid #30363d;'>")
-
-        # ── TRAINING CURVES ────────────────────────────────────
-        gr.HTML("""
-        <div class="section-card">
-            <h2 style="margin:0;">📉 Training Analysis</h2>
-            <p style="margin:5px 0 0; color:#e6edf3;">Epoch-by-epoch performance tracking across both training phases</p>
-        </div>
-        """)
-
-        gr.HTML("""
-        <div class="info-card">
-            <table style="width:100%; border-collapse:collapse; font-size:14px; background:#161b22;">
-                <tr style="background:#0f3460;" class="dark-header">
-                    <th style="padding:8px; color:#ffffff;">Epoch</th>
-                    <th style="padding:8px; color:#ffffff;">Train Loss</th>
-                    <th style="padding:8px; color:#ffffff;">Val Loss</th>
-                    <th style="padding:8px; color:#ffffff;">Train Acc</th>
-                    <th style="padding:8px; color:#ffffff;">Val Acc</th>
-                    <th style="padding:8px; color:#ffffff;">Overfit Gap</th>
-                    <th style="padding:8px; color:#ffffff;">LR</th>
-                    <th style="padding:8px; color:#ffffff;">Phase</th>
-                </tr>
-                <tr style="background:#1c2333;" class="light-row"><td style="padding:6px; text-align:center; color:#e6edf3;">1</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.2965</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.1967</td><td style="padding:6px; text-align:center; color:#e6edf3;">87.09%</td><td style="padding:6px; text-align:center; color:#e6edf3;">91.44%</td><td style="padding:6px; text-align:center; color:#3fb950;">-4.35</td><td style="padding:6px; text-align:center; color:#e6edf3;">1e-4</td><td style="padding:6px; text-align:center; color:#e6edf3;">❄️ Frozen</td></tr>
-                <tr style="background:#161b22;" class="light-row"><td style="padding:6px; text-align:center; color:#e6edf3;">5</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0420</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0943</td><td style="padding:6px; text-align:center; color:#e6edf3;">98.59%</td><td style="padding:6px; text-align:center; color:#e6edf3;">96.26%</td><td style="padding:6px; text-align:center; color:#e6edf3;">2.33</td><td style="padding:6px; text-align:center; color:#e6edf3;">6.5e-5</td><td style="padding:6px; text-align:center; color:#e6edf3;">❄️ Frozen</td></tr>
-                <tr style="background:#1c2333;" class="light-row"><td style="padding:6px; text-align:center; color:#e6edf3;">10</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0172</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0612</td><td style="padding:6px; text-align:center; color:#e6edf3;">99.53%</td><td style="padding:6px; text-align:center; color:#e6edf3;">97.95%</td><td style="padding:6px; text-align:center; color:#e6edf3;">1.58</td><td style="padding:6px; text-align:center; color:#e6edf3;">2e-6</td><td style="padding:6px; text-align:center; color:#e6edf3;">❄️ Frozen</td></tr>
-                <tr style="background:#0d2818;" class="light-row"><td style="padding:6px; text-align:center; color:#e6edf3;">11</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0312</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0423</td><td style="padding:6px; text-align:center; color:#e6edf3;">98.93%</td><td style="padding:6px; text-align:center; color:#e6edf3;">98.31%</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.62</td><td style="padding:6px; text-align:center; color:#e6edf3;">1e-5</td><td style="padding:6px; text-align:center; color:#e6edf3;">🔥 Fine-tune</td></tr>
-                <tr style="background:#0d3320; font-weight:bold;" class="light-row"><td style="padding:6px; text-align:center; color:#e6edf3;">13 ⭐</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0082</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0203</td><td style="padding:6px; text-align:center; color:#e6edf3;">99.74%</td><td style="padding:6px; text-align:center; color:#e6edf3;">99.16%</td><td style="padding:6px; text-align:center; color:#3fb950;">0.58</td><td style="padding:6px; text-align:center; color:#e6edf3;">1e-5</td><td style="padding:6px; text-align:center; color:#e6edf3;">🔥 Best</td></tr>
-                <tr style="background:#0d2818;" class="light-row"><td style="padding:6px; text-align:center; color:#e6edf3;">15</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0083</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.0268</td><td style="padding:6px; text-align:center; color:#e6edf3;">99.82%</td><td style="padding:6px; text-align:center; color:#e6edf3;">98.91%</td><td style="padding:6px; text-align:center; color:#e6edf3;">0.91</td><td style="padding:6px; text-align:center; color:#e6edf3;">9e-6</td><td style="padding:6px; text-align:center; color:#e6edf3;">🔥 Fine-tune</td></tr>
-            </table>
-            <div style="margin-top:15px; display:flex; gap:20px; flex-wrap:wrap;">
-                <div style="background:#1c2333; padding:12px 18px; border-radius:8px; flex:1; min-width:200px;">
-                    <b style="color:#e6edf3;">Max Overfit Gap:</b> <span style="color:#e6edf3;">2.73% (epoch 3) — </span><span style="color:#3fb950;">✓ minimal</span>
-                </div>
-                <div style="background:#1c2333; padding:12px 18px; border-radius:8px; flex:1; min-width:200px;">
-                    <b style="color:#e6edf3;">Best Val Accuracy:</b> <span style="color:#e6edf3;">99.16% (epoch 13)</span>
-                </div>
-                <div style="background:#1c2333; padding:12px 18px; border-radius:8px; flex:1; min-width:200px;">
-                    <b style="color:#e6edf3;">Train/Test Delta:</b> <span style="color:#e6edf3;">0.94% — </span><span style="color:#3fb950;">✓ excellent generalization</span>
-                </div>
-            </div>
-        </div>
-        """)
-
-        gr.HTML("<hr style='margin:30px 0; border:none; border-top:1px solid #30363d;'>")
-
-        # ── APPROACH JUSTIFICATION ─────────────────────────────
-        gr.HTML("""
-        <div class="section-card">
-            <h2 style="margin:0;">📚 Approach Justification</h2>
-        </div>
-        """)
-
-        with gr.Row():
-            with gr.Column():
-                gr.HTML("""
-                <div class="info-card">
-                    <h3 style="margin-top:0; color:#e6edf3;">Why Hybrid CNN + ViT?</h3>
-                    <ul style="line-height:2; color:#e6edf3;">
-                        <li><b>EfficientNet-B3 (CNN):</b> Captures local texture, edge, and bone cortex patterns — critical for detecting fine fracture lines</li>
-                        <li><b>ViT-Small (Transformer):</b> Models long-range spatial dependencies — understands whole-bone geometry and fracture continuity</li>
-                        <li><b>Cross-Attention Fusion:</b> Lets CNN and ViT features attend to each other — richer than simple concatenation</li>
-                        <li><b>2-Phase Training:</b> First learns good fusion weights (frozen backbones), then fine-tunes end-to-end with low LR</li>
-                    </ul>
-                </div>
-                """)
-            with gr.Column():
-                gr.HTML("""
-                <div class="info-card">
-                    <h3 style="margin-top:0; color:#e6edf3;">Key Design Decisions</h3>
-                    <ul style="line-height:2; color:#e6edf3;">
-                        <li><b>Only ImageNet pretrained:</b> No fracture/medical pretraining used — compliant with hackathon rules</li>
-                        <li><b>Cross-Attention > Concat:</b> Q=CNN, K=V=ViT allows bidirectional feature interaction (d=512)</li>
-                        <li><b>EfficientNet-B3:</b> Best FLOPs/accuracy trade-off among EfficientNet variants</li>
-                        <li><b>ViT-Small Patch16:</b> 22M params with 16×16 patches — good balance of detail and efficiency</li>
-                        <li><b>CLAHE Augmentation:</b> Enhances local contrast in bone structures for better feature extraction</li>
-                    </ul>
-                </div>
-                """)
-
-        gr.HTML("<hr style='margin:30px 0; border:none; border-top:1px solid #30363d;'>")
-
-        # ── SYSTEM INFO ────────────────────────────────────────
-        gr.HTML("""
-        <div class="section-card">
-            <h2 style="margin:0;">⚙️ System & Reproducibility</h2>
-        </div>
-        """)
-
-        gr.HTML("""
-        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:15px; margin:15px 0;">
-            <div class="info-card">
-                <h3 style="margin-top:0; color:#e6edf3;">🔧 Technical Stack</h3>
-                <ul style="line-height:2; color:#e6edf3;">
-                    <li><b>Framework:</b> PyTorch 2.10.0</li>
-                    <li><b>Model Library:</b> timm 1.0.25</li>
-                    <li><b>Augmentation:</b> Albumentations</li>
-                    <li><b>Visualization:</b> Matplotlib + OpenCV</li>
-                    <li><b>Web UI:</b> Gradio</li>
-                    <li><b>Device:</b> Apple M2 (MPS)</li>
-                </ul>
-            </div>
-            <div class="info-card">
-                <h3 style="margin-top:0; color:#e6edf3;">🔁 Reproducibility</h3>
-                <ul style="line-height:2; color:#e6edf3;">
-                    <li><b>Random Seed:</b> 42 (all libraries)</li>
-                    <li><b>Config:</b> config.yaml (all hyperparams)</li>
-                    <li><b>Requirements:</b> requirements.txt (pinned versions)</li>
-                    <li><b>Checkpoint:</b> model.pth (epoch 13)</li>
-                    <li><b>Codebase:</b> Modular (data_loader, model, train, evaluate, explainability)</li>
-                </ul>
-            </div>
-            <div class="info-card">
-                <h3 style="margin-top:0; color:#e6edf3;">📂 Project Structure</h3>
-                <pre style="font-size:13px; line-height:1.6; margin:0; color:#e6edf3;">
-├── config.yaml
-├── data_loader.py
-├── model.py
-├── train.py
-├── evaluate.py
-├── explainability.py
-├── app.py
-├── requirements.txt
-├── checkpoints/model.pth
-└── results/
-    ├── confusion_matrix.png
-    └── explainability/</pre>
-            </div>
-        </div>
-        """)
-
-        # ── DISCLAIMER ─────────────────────────────────────────
-        gr.HTML("""
-        <div class="warning-box">
-            <h3 style="margin-top:0; color:#e6edf3;">⚠️ Medical Disclaimer</h3>
-            <p style="margin:0; line-height:1.6; color:#e6edf3;">
-                This system is provided for <b>educational and research purposes only</b> as part of the
-                KBG Hackathon 2025 at IIT Mandi. All results must be verified by qualified healthcare professionals.
-                This is <b>NOT a medical device</b> and should not be used as the sole basis for clinical decisions.
-            </p>
-        </div>
-        """)
-
-        # ── FOOTER ─────────────────────────────────────────────
-        gr.HTML("""
-        <div class="footer-box">
-            <p style="font-size:18px; margin:0; font-weight:600;">
-                Developed by <span style="color:#58a6ff;"><b>Aditya Rai</b></span>
-            </p>
-            <p style="font-size:14px; margin:8px 0 0; color:#e6edf3;">
-                KBG Hackathon 2025 &nbsp;•&nbsp; Kamand Bioengineering Group &nbsp;•&nbsp; IIT Mandi
-            </p>
-            <p style="font-size:13px; margin:5px 0 0; color:#8b949e;">
-                Powered by PyTorch, timm, Gradio & Hugging Face
-            </p>
+        <div class="footer-line">
+            <p>Built by <span>Aditya Rai</span></p>
+            <p>KBG Hackathon 2025 &middot; IIT Mandi &middot; PyTorch &middot; Gradio</p>
         </div>
         """)
 
@@ -784,15 +424,6 @@ Not   [   5    263   ]
 
 # ── Launch ────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("Bone Fracture Classification — KBG Hackathon 2025".center(60))
-    print("=" * 60)
-    print(f"PyTorch: {torch.__version__}")
-    dev = "CUDA" if torch.cuda.is_available() else ("MPS" if torch.backends.mps.is_available() else "CPU")
-    print(f"Device:  {dev}")
-    print(f"Model:   {CHECKPOINT}")
-    print("=" * 60 + "\n")
-
     demo = create_interface()
     demo.launch(
         server_name="0.0.0.0",

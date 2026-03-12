@@ -1,0 +1,128 @@
+Metric Category,Metric,Value,Notes
+,,,,
+OVERALL PERFORMANCE,,,,
+,Test Accuracy,88.76%,On 1130 unseen test images
+,Validation Accuracy,95.86%,Best checkpoint (epoch 8)
+,Test F1 Score (Macro),0.8773,Average across all 4 classes
+,Test F1 Score (Weighted),0.8806,Weighted by class support
+,Test Precision (Macro),0.9199,Average precision across classes
+,Test Recall (Macro),0.8674,Average recall across classes
+,AUC-ROC (Macro),0.9944,Near-perfect class separability
+,Inference Speed,28.9 ms/image,On Apple M2 (MPS)
+,,,,
+BONE X-RAY PERFORMANCE,,,,
+,Bone Accuracy,95.45%,Fractured vs Not Fractured only
+,Bone F1 (Weighted),0.9546,On 506 bone test images
+,,,,
+CHEST X-RAY PERFORMANCE,,,,
+,Chest Accuracy,83.33%,Normal vs Pneumonia only
+,Chest F1 (Weighted),0.8206,On 624 chest test images
+,,,,
+PER-CLASS: FRACTURED,,,,
+,Precision,0.9498,Of predicted fractured — 95% correct
+,Recall,0.9538,Of actual fractured — 95.4% detected
+,F1 Score,0.9518,Harmonic mean of precision and recall
+,AUC-ROC,0.9991,Near-perfect separation
+,Test Support,238,Number of fractured test images
+,,,,
+PER-CLASS: NOT FRACTURED,,,,
+,Precision,0.9588,Of predicted not fractured — 95.9% correct
+,Recall,0.9552,Of actual not fractured — 95.5% detected
+,F1 Score,0.9570,Harmonic mean of precision and recall
+,AUC-ROC,0.9992,Near-perfect separation
+,Test Support,268,Number of not fractured test images
+,,,,
+PER-CLASS: NORMAL LUNGS,,,,
+,Precision,0.9779,Of predicted normal — 97.8% correct
+,Recall,0.5684,Of actual normal — 56.8% detected
+,F1 Score,0.7189,Lower due to recall gap
+,AUC-ROC,0.9882,Strong probabilistic separation
+,Test Support,234,Number of normal chest test images
+,,,,
+PER-CLASS: PNEUMONIA,,,,
+,Precision,0.7930,Of predicted pneumonia — 79.3% correct
+,Recall,0.9923,Of actual pneumonia — 99.2% detected
+,F1 Score,0.8815,Strong — catches almost all pneumonia
+,AUC-ROC,0.9909,Strong probabilistic separation
+,Test Support,390,Number of pneumonia chest test images
+,,,,
+CONFUSION MATRIX,,fractured,not fractured,NORMAL,PNEUMONIA
+,Actual: fractured,227,11,0,0
+,Actual: not fractured,12,256,0,0
+,Actual: NORMAL,0,0,133,101
+,Actual: PNEUMONIA,0,0,3,387
+,,,,
+MODEL ARCHITECTURE,,,,
+,Model Name,HybridCNNViT,Custom hybrid architecture
+,CNN Backbone,EfficientNet-B3,"1536-dim features, ImageNet pretrained"
+,Transformer,ViT-Small-Patch16-224,"384-dim features, ImageNet pretrained"
+,Fusion Method,Cross-Attention,"Q=CNN, K/V=ViT, d=512"
+,Classifier Head,Linear(512-256) + ReLU + Dropout(0.3) + Linear(256-4),
+,Total Parameters,"33,939,116",~34M parameters
+,Input Size,224 x 224 x 3,RGB normalized to ImageNet stats
+,Output Classes,4,"fractured, not fractured, NORMAL, PNEUMONIA"
+,,,,
+TRAINING CONFIGURATION,,,,
+,Total Epochs Trained,8,Stopped at epoch 8 (best checkpoint)
+,Phase 1 (Frozen),Epochs 1-7,"1,577,220 trainable params (fusion + head only)"
+,Phase 2 (Fine-tune),Epoch 8+,"33,939,116 trainable params (all layers)"
+,Optimizer,AdamW,weight_decay=0.01
+,Phase 1 Learning Rate,1e-4,With cosine annealing
+,Phase 2 Learning Rate,1e-5,10x lower for fine-tuning
+,Scheduler,CosineAnnealingLR,Smooth LR decay
+,Loss Function,Weighted CrossEntropyLoss,Handles class imbalance
+,Class Weights (fractured),0.785,Slight downweight (large class)
+,Class Weights (not fractured),0.779,Slight downweight (large class)
+,Class Weights (NORMAL),2.696,Upweighted (underrepresented)
+,Class Weights (PNEUMONIA),0.933,Near neutral
+,Batch Size,16,
+,Random Seed,42,For reproducibility
+,,,,
+DATA AUGMENTATION (TRAINING ONLY),,,,
+,Horizontal Flip,p=0.5,Random left-right flip
+,Affine Rotation,-15 to +15 degrees,With 5% translate and 5% scale
+,CLAHE,clip_limit=2.0,Contrast Limited Adaptive Histogram Equalization
+,Random Brightness/Contrast,+/- 15%,Simulates exposure variation
+,Normalization,ImageNet mean/std,"mean=[0.485, 0.456, 0.406]"
+,Resize,224 x 224,Bilinear interpolation
+,,,,
+DATASET SUMMARY,,,,
+,Total Training Images,"14,462",Combined bone + chest
+,Total Validation Images,845,Combined bone + chest
+,Total Test Images,"1,130",Combined bone + chest
+,Train: fractured,"4,606",Bone X-ray class
+,Train: not fractured,"4,640",Bone X-ray class
+,Train: NORMAL,"1,341",Chest X-ray class
+,Train: PNEUMONIA,"3,875",Chest X-ray class
+,Val: fractured,337,
+,Val: not fractured,492,
+,Val: NORMAL,8,Small validation set
+,Val: PNEUMONIA,8,Small validation set
+,Test: fractured,238,
+,Test: not fractured,268,
+,Test: NORMAL,234,
+,Test: PNEUMONIA,390,
+,Bone Dataset Source,Roboflow Bone Fracture Binary Classification,
+,Chest Dataset Source,Kaggle Chest X-ray Pneumonia,
+,,,,
+TRAINING HISTORY,,,,
+Phase,Epoch,Train Loss,Train Acc,Val Loss,Val Acc,Val F1,LR
+frozen,1,0.3087,86.17%,0.3013,88.28%,0.8155,0.000100
+frozen,2,0.1724,93.40%,0.2424,90.30%,0.8184,0.000095
+frozen,3,0.1328,95.11%,0.1700,92.66%,0.8168,0.000081
+frozen,4,0.1047,96.32%,0.1648,93.25%,0.8409,0.000061
+frozen,5,0.0901,96.77%,0.1500,94.20%,0.8082,0.000039
+frozen,6,0.0823,97.31%,0.1332,94.91%,0.8284,0.000019
+frozen,7,0.0732,97.61%,0.1280,94.91%,0.8284,0.000005
+finetune,8,0.0864,97.10%,0.1006,95.86%,0.8548,0.000010
+,,,,
+SOFTWARE STACK,,,,
+,Python,3.13.7,
+,PyTorch,2.10.0,
+,timm,1.0.25,Model library
+,Albumentations,2.0.8,Augmentation
+,scikit-learn,1.8.0,Metrics
+,OpenCV,4.13.0,Image processing
+,Gradio,6.9.0,Web interface
+,NumPy,2.4.2,
+,Hardware,Apple M2 (MPS),MacBook Air

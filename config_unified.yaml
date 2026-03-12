@@ -1,0 +1,32 @@
+# ============================================================
+# Unified Medical X-ray Classifier — Config
+# 4 classes: fractured, not fractured, NORMAL, PNEUMONIA
+# ============================================================
+
+# Bone dataset
+bone_dataset_path: "dataset/Bone_Fracture_Binary_Classification/Bone_Fracture_Binary_Classification"
+
+# Chest X-ray dataset
+chest_dataset_path: "chest_xray"
+
+image_size: 224
+batch_size: 16
+
+# Training
+epochs: 15
+learning_rate: 1.0e-4
+weight_decay: 1.0e-2
+early_stopping_patience: 10
+freeze_epochs: 7        # Phase 1: frozen backbones
+seed: 42
+num_workers: 2
+
+# Model
+model_backbone: "efficientnet_b3"
+vit_model: "vit_small_patch16_224"
+fusion_method: "cross_attention"
+dropout: 0.3
+
+# Scheduler
+scheduler: "cosine_annealing"
+T_max: 15
