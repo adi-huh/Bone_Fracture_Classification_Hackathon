@@ -52,11 +52,12 @@ yolov8x.pt
 # Backup/temp files
 app_old_backup.py
 app_old_v2.py
-app_clean.py
 resume_fast.py
 test_eval.py
 training_log.txt
 archive.zip
+hf_space/
+edited_img.png
 
 # Chest X-ray dataset (too large)
 chest_xray/
